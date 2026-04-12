@@ -24,19 +24,18 @@ _SYSTEM_BASE = """You are a data analyst assistant inside a "Talk to Data" appli
 You receive pre-computed, aggregated numbers from a dataset and your job is to explain
 them clearly to a non-technical business user.
 
-STRICT RULES — follow every one of these:
-1. Answer in 3–5 sentences. No bullet points. No headers. Plain prose only.
-2. Lead with the single most important finding (biggest number, largest change, dominant segment).
-3. Mention specific numbers from the data (exact values or percentages). Vague language like
-   "significantly higher" without a number is not acceptable.
-4. Use plain English. If you must use a statistical word (e.g. "median"), define it in parentheses.
-5. Do not invent or infer anything not present in the aggregated data provided.
-6. Do not reference column names in a database/technical sense (e.g. do not say "the 'Sales_Amount'
-   column"). Instead, refer to it by its human-readable meaning (e.g. "sales").
+STRICT RULES — follow all of these:
+1. Write 3–5 complete sentences. No bullet points. No headers. Plain prose only.
+2. Lead with the single most important finding (biggest number, largest change, dominant group).
+3. Always state specific numbers from the data. Never say "significantly higher" without a number.
+4. Use plain English. If you use a statistical word (e.g. "median"), define it in parentheses.
+5. Do not invent anything not present in the aggregated data provided to you.
+6. Refer to columns by their human meaning, not their technical name
+   (e.g. say "age" not "the Age column", say "sales" not "the Sales_Amount field").
 7. Do not reveal raw individual records or any personally identifiable information.
-8. End with one sentence that tells the user what to explore next or what question to ask.
-9. Stick strictly to what the numbers show. Do not use external knowledge to infer context
-   (e.g. do not assume "Iris" means flowers unless the data says so explicitly)."""
+8. End with one actionable sentence: what the user could explore next.
+9. CRITICAL: You MUST finish every sentence. Never stop mid-sentence.
+10. Stick to what the data shows. Do not use external knowledge to infer context."""
 
 
 # ── Intent-specific prompt builders ──────────────────────────────────────────
@@ -44,27 +43,29 @@ STRICT RULES — follow every one of these:
 def _build_change_prompt(question: str, intent: dict, result: dict) -> str:
     analysis_type = result.get("analysis_type", "group_ranking")
     data_json = json.dumps(result["aggregated_data"], indent=2)
+    group_col = result.get("group_col", "group")
 
     if analysis_type == "period_over_period":
         instruction = (
-            "The data shows period-over-period changes for each group. "
+            f"The data shows period-over-period changes grouped by {group_col}. "
             "'period_1' is the earlier half of the data, 'period_2' is the later half. "
             "'delta' is the absolute change (positive = increase, negative = decrease). "
             "'pct_change' is the percentage change. "
-            "Identify the group with the largest absolute change, explain whether it increased or decreased, "
-            "and name the top contributor. If most groups moved in the same direction, note that pattern."
+            "Identify the group with the largest absolute change and state whether it increased or decreased. "
+            "If multiple groups moved in the same direction, note that pattern."
         )
     else:
         instruction = (
-            "The data shows the current value and percentage share for each group. "
-            "Identify the dominant group and its share, then note how the others compare. "
-            "Since no direct time comparison is available, focus on the current distribution "
-            "and which groups are leading vs lagging."
+            f"The data shows {result['metric_used']} for each {group_col}. "
+            "'value' is the metric value; 'share_pct' is its percentage of the total. "
+            "Identify the dominant group and its value, then note how the others compare. "
+            "Since no time comparison is available, focus on the current ranking."
         )
 
     return (
         f'User question: "{question}"\n'
         f"Metric: {result['metric_used']}\n"
+        f"Grouping column: {group_col}\n"
         f"Time range: {intent.get('time_range') or 'not specified'}\n"
         f"Analysis type: {analysis_type}\n\n"
         f"Data:\n{data_json}\n\n"
@@ -74,14 +75,25 @@ def _build_change_prompt(question: str, intent: dict, result: dict) -> str:
 
 def _build_compare_prompt(question: str, intent: dict, result: dict) -> str:
     data_json = json.dumps(result["aggregated_data"], indent=2)
+    group_col = result.get("group_col", "group")
+    agg_func = result.get("agg_func", "")
+    agg_label = {
+        "mean": "average", "sum": "total", "count": "count",
+        "max": "maximum", "min": "minimum", "median": "median",
+    }.get(agg_func, agg_func)
+
     return (
         f'User question: "{question}"\n'
-        f"Metric(s): {result['metric_used']}\n\n"
-        f"Comparison data:\n{data_json}\n\n"
-        "Instructions: Identify which group or metric performs best. State the winner clearly "
-        "and by how much (use the 'diff_from_leader' field if present). Then briefly note "
-        "any interesting patterns among the remaining groups. If multiple metrics are compared, "
-        "mention which group leads on each metric."
+        f"Metric: {result['metric_used']}\n"
+        f"Grouping column: {group_col}\n"
+        f"Aggregation: {agg_label} per group\n\n"
+        f"Comparison data (sorted highest to lowest):\n{data_json}\n\n"
+        "Instructions: "
+        f"State which {group_col} has the highest {agg_label} and give the exact value. "
+        "Then compare it to the next group(s). If 'diff_from_leader' is present, use it "
+        "to state the gap (e.g. 'Group B is 3.2 lower than Group A'). "
+        "Cover all groups shown in the data — do not skip any. "
+        "Conclude with what this comparison suggests."
     )
 
 
@@ -89,26 +101,36 @@ def _build_breakdown_prompt(question: str, intent: dict, result: dict) -> str:
     data_json = json.dumps(result["aggregated_data"], indent=2)
     group_col = result.get("group_col", "category")
     total_groups = result.get("total_groups", len(result["aggregated_data"]))
+    show_pct = result.get("show_pct", True)
     secondary = result.get("secondary_breakdown")
     secondary_col = result.get("secondary_group_col")
+
+    pct_note = (
+        "Each entry has 'value' and 'percentage' (share of total)."
+        if show_pct
+        else "Each entry has 'value' only (percentages are not shown because the metric is an average)."
+    )
 
     extra = ""
     if secondary:
         extra = (
             f"\n\nSecondary breakdown by {secondary_col}:\n"
             f"{json.dumps(secondary, indent=2)}\n"
-            "After discussing the primary breakdown, add one sentence about the secondary dimension."
+            "After the primary breakdown, add one sentence about the secondary dimension."
         )
 
     return (
         f'User question: "{question}"\n'
         f"Metric: {result['metric_used']}\n"
-        f"Grouped by: {group_col} ({total_groups} total groups, showing top 10)\n\n"
-        f"Breakdown data (value + percentage of total):\n{data_json}"
+        f"Grouped by: {group_col} ({total_groups} total groups, showing top 10)\n"
+        f"{pct_note}\n\n"
+        f"Breakdown data:\n{data_json}"
         f"{extra}\n\n"
-        "Instructions: Start with the largest segment and its percentage share. "
-        "Then mention the second and third largest. If an 'Other' bucket exists, note it. "
-        "Conclude with one observation about concentration (e.g. whether one group dominates)."
+        "Instructions: Start with the largest segment and its value"
+        + (" and percentage share" if show_pct else "")
+        + ". Then cover the second and third largest. "
+        "If an 'Other' bucket exists, mention it. "
+        "Conclude with whether one group dominates or values are spread evenly."
     )
 
 
@@ -117,27 +139,27 @@ def _build_summary_prompt(question: str, intent: dict, result: dict) -> str:
 
     if analysis_type == "categorical_summary":
         data_json = json.dumps(result["aggregated_data"], indent=2)
-        group_col = result.get("group_col", "category")
+        group_col = result.get("group_col", "column")
         total_groups = result.get("total_groups", len(result["aggregated_data"]))
         return (
             f'User question: "{question}"\n'
-            f"Column analysed: {group_col} ({total_groups} unique values)\n\n"
-            f"Value distribution (count + % of total rows):\n{data_json}\n\n"
-            "Instructions: Tell the user what unique values this column contains, "
-            "which value appears most frequently and its percentage, and how evenly or "
-            "unevenly distributed the values are. Mention the total number of unique values."
+            f"Column: {group_col} ({total_groups} unique values)\n\n"
+            f"Value distribution (count + percentage of total):\n{data_json}\n\n"
+            "Instructions: State the total number of unique values. "
+            "Name the most frequent value and its percentage. "
+            "Describe how evenly or unevenly distributed the values are. "
+            "Cover all values shown in the data."
         )
 
     data_json = json.dumps(result["aggregated_data"], indent=2)
     return (
         f'User question: "{question}"\n'
         f"Metric(s): {result['metric_used']}\n\n"
-        f"Statistical summary:\n{data_json}\n\n"
-        "Instructions: For each metric, lead with its mean (explain: average) and range (min to max). "
-        "If a 'trend' field is present, mention it ('increasing', 'decreasing', or 'stable') and "
-        "the 'trend_pct_change' if available. If 'outlier_count' is non-zero, note it. "
-        "For categorical fields, mention the most frequent value and how many unique values exist. "
-        "Keep the answer focused on what is most useful for a business user."
+        f"Statistical summary (one entry per metric column):\n{data_json}\n\n"
+        "Instructions: For each metric, state the mean (average) and the range (min to max). "
+        "If 'trend' is present, mention it and the 'trend_pct_change'. "
+        "If 'outlier_count' is non-zero, note how many outliers exist. "
+        "Keep the answer focused and useful for a non-technical user."
     )
 
 
@@ -152,12 +174,12 @@ _PROMPT_BUILDERS = {
 # ── Chart data builder ────────────────────────────────────────────────────────
 
 def _build_chart_data(aggregated_data: dict, intent_type: str, analysis_type: str) -> list[dict]:
-    """Convert aggregated data into a flat list of chart-ready data points."""
+    """Convert aggregated engine data into chart-ready data points."""
     chart_data: list[dict] = []
 
+    # ── SUMMARY ───────────────────────────────────────────────────────────
     if intent_type == "SUMMARY":
         if analysis_type == "categorical_summary":
-            # Frequency chart: one bar per category value
             for cat_val, stats in aggregated_data.items():
                 if isinstance(stats, dict):
                     chart_data.append({
@@ -167,24 +189,27 @@ def _build_chart_data(aggregated_data: dict, intent_type: str, analysis_type: st
                     })
             return chart_data
 
-        # Numeric summary → map primary mean to "value" so regular BarChart can draw it.
-        # Ensure we always output {"name": str, "value": number}
+        # Numeric summary → one row per metric, with mean/min/max keys
+        # Frontend renders as grouped bar (mean bar + error range, or separate bars)
         for metric_name, stats in aggregated_data.items():
             if not isinstance(stats, dict):
                 continue
             if "mean" in stats:
                 chart_data.append({
                     "name": metric_name,
-                    "value": stats.get("mean"),
+                    "mean": stats.get("mean"),
                     "min": stats.get("min"),
                     "max": stats.get("max"),
+                    "median": stats.get("median"),
+                    # "value" alias for plain BarChart fallback
+                    "value": stats.get("mean"),
                 })
             elif "unique_values" in stats:
-                # Categorical column inside a numeric summary – show top values
                 for val, cnt in stats.get("top_values", {}).items():
-                    chart_data.append({"name": f"{metric_name}:{val}", "value": cnt})
+                    chart_data.append({"name": str(val), "value": cnt})
         return chart_data
 
+    # ── CHANGE period_over_period ─────────────────────────────────────────
     if intent_type == "CHANGE" and analysis_type == "period_over_period":
         for group, vals in aggregated_data.items():
             if isinstance(vals, dict) and "period_1" in vals:
@@ -196,16 +221,25 @@ def _build_chart_data(aggregated_data: dict, intent_type: str, analysis_type: st
                 })
         return chart_data
 
-    # CHANGE (group_ranking), COMPARE, BREAKDOWN
+    # ── COMPARE, CHANGE (group_ranking), BREAKDOWN ────────────────────────
     for key, value in aggregated_data.items():
         if isinstance(value, dict):
             entry: dict[str, Any] = {"name": str(key)}
             if "value" in value:
                 entry["value"] = value["value"]
             else:
+                # Multi-metric COMPARE: include every numeric sub-field
                 for sub_key, sub_val in value.items():
-                    if isinstance(sub_val, (int, float)):
+                    if isinstance(sub_val, (int, float)) and sub_key != "diff_from_leader":
                         entry[sub_key] = round(float(sub_val), 2)
+                # Still need a "value" fallback for single-key bar charts
+                if "value" not in entry and entry:
+                    first_numeric = next(
+                        (v for k, v in entry.items() if k != "name" and isinstance(v, (int, float))),
+                        None,
+                    )
+                    if first_numeric is not None:
+                        entry["value"] = first_numeric
             if "percentage" in value:
                 entry["percentage"] = value["percentage"]
             if "share_pct" in value:
@@ -242,7 +276,6 @@ def generate_answer(
     intent_type = intent.get("intent", "SUMMARY")
     analysis_type = engine_result.get("analysis_type", "unknown")
 
-    # Build the intent-specific user prompt
     prompt_builder = _PROMPT_BUILDERS.get(intent_type, _build_summary_prompt)
     user_prompt = prompt_builder(question, intent, engine_result)
 
@@ -253,15 +286,25 @@ def generate_answer(
         model="gemini-2.5-flash",
         contents=user_prompt,
         config=genai.types.GenerateContentConfig(
-            system_instruction=_SYSTEM_BASE + "\nCRITICAL INSTRUCTION: You MUST completely finish your final sentence. NEVER terminate your response abruptly.",
+            system_instruction=_SYSTEM_BASE,
             max_output_tokens=2048,
-            temperature=0.3,
+            temperature=0.2,      # lower = more factual, less hallucination
         ),
     )
 
-    answer_text = response.text.strip()
+    # Check finish reason to detect truncation
+    answer_text = response.text.strip() if response.text else ""
+    try:
+        finish_reason = response.candidates[0].finish_reason
+        if str(finish_reason) in ("MAX_TOKENS", "2"):  # 2 is the proto enum value
+            logger.warning("Gemini response was truncated (MAX_TOKENS). Consider raising limit.")
+            # Append a safe notice rather than returning a broken sentence
+            if answer_text and not answer_text.endswith((".", "!", "?")):
+                answer_text = answer_text.rsplit(" ", 1)[0] + "."
+    except (AttributeError, IndexError):
+        pass
 
-    # Determine chart type from engine hint first, then intent default
+    # Chart type: engine hint takes precedence
     chart_type = engine_result.get("chart_hint", _intent_default_chart(intent_type))
     if analysis_type == "period_over_period":
         chart_type = "grouped_bar"
