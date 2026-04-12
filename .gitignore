@@ -1,0 +1,41 @@
+# Common ignore patterns for Talk to Data (Python/React/FastAPI)
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Node.js
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local data and logs
+*.db
+*.sqlite
+uploads/
+logs/
+*.log
+
+# Editor / IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db

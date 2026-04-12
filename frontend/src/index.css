@@ -1,0 +1,133 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ─── Base styles ─────────────────────────────────────────────── */
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  background: #020617;
+  color: #f1f5f9;
+  min-height: 100vh;
+}
+
+/* ─── Scrollbar styling ──────────────────────────────────────── */
+
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0f172a;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #475569;
+}
+
+/* ─── Glass morphism utility ─────────────────────────────────── */
+
+.glass {
+  background: rgba(15, 23, 42, 0.7);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(99, 102, 241, 0.15);
+}
+
+.glass-light {
+  background: rgba(30, 41, 59, 0.5);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(148, 163, 184, 0.1);
+}
+
+/* ─── Gradient backgrounds ───────────────────────────────────── */
+
+.gradient-primary {
+  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 50%, #a78bfa 100%);
+}
+
+.gradient-glow {
+  background: radial-gradient(
+    ellipse 80% 50% at 50% -20%,
+    rgba(99, 102, 241, 0.15),
+    transparent
+  );
+}
+
+/* ─── Upload drop zone ───────────────────────────────────────── */
+
+.drop-zone {
+  border: 2px dashed rgba(99, 102, 241, 0.3);
+  transition: all 0.3s ease;
+}
+
+.drop-zone:hover,
+.drop-zone.dragging {
+  border-color: rgba(99, 102, 241, 0.7);
+  background: rgba(99, 102, 241, 0.05);
+}
+
+/* ─── Shimmer loading effect ─────────────────────────────────── */
+
+.shimmer {
+  background: linear-gradient(
+    90deg,
+    rgba(30, 41, 59, 0.5) 25%,
+    rgba(51, 65, 85, 0.5) 50%,
+    rgba(30, 41, 59, 0.5) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+}
+
+@keyframes shimmer {
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* ─── Chart container ────────────────────────────────────────── */
+
+.chart-container {
+  width: 100%;
+  min-height: 300px;
+}
+
+.chart-container .recharts-text {
+  fill: #94a3b8;
+  font-size: 12px;
+}
+
+.chart-container .recharts-cartesian-grid-horizontal line,
+.chart-container .recharts-cartesian-grid-vertical line {
+  stroke: rgba(51, 65, 85, 0.4);
+}
+
+/* ─── Tooltip override for Recharts ──────────────────────────── */
+
+.recharts-tooltip-wrapper .recharts-default-tooltip {
+  background: rgba(15, 23, 42, 0.95) !important;
+  border: 1px solid rgba(99, 102, 241, 0.3) !important;
+  border-radius: 8px !important;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4) !important;
+}
+
+.recharts-tooltip-wrapper .recharts-tooltip-label {
+  color: #e2e8f0 !important;
+  font-weight: 600 !important;
+}
+
+.recharts-tooltip-wrapper .recharts-tooltip-item {
+  color: #a5b4fc !important;
+}
