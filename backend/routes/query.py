@@ -25,14 +25,23 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Maximum number of sample values to pass per column to the intent parser
+# Maximum distinct sample values to pass per column to the intent parser
 _MAX_SAMPLES_PER_COL = 4
-# Maximum number of columns to send sample values for (keeps prompt size reasonable)
+# Maximum number of columns to include samples for (keeps prompt compact)
 _MAX_COLS_WITH_SAMPLES = 30
 
 
 def _extract_schema_metadata(df: pd.DataFrame) -> tuple[dict[str, str], dict[str, list]]:
     """Extract column dtypes and representative sample values from a DataFrame.
+
+    For numeric columns we show a small random sample of distinct values rather
+    than [min, median, max]. The min/max pair can mislead the LLM into thinking
+    extreme outliers are typical values (e.g. PassengerId 1 and 891 look like
+    meaningful categories). A random sample of distinct values is more informative
+    for intent classification.
+
+    For categorical columns we show the most frequent values so the LLM can
+    ground grouping phrases like "for different sex" → ["male", "female"].
 
     Args:
         df: The session DataFrame.
@@ -55,14 +64,24 @@ def _extract_schema_metadata(df: pd.DataFrame) -> tuple[dict[str, str], dict[str
             col_samples[col] = []
             continue
 
-        if pd.api.types.is_numeric_dtype(series):
-            # For numeric columns: show min, median, max, and one random mid-value
-            vals = [series.min(), series.median(), series.max()]
-            col_samples[col] = [round(float(v), 4) for v in vals[:_MAX_SAMPLES_PER_COL]]
-        elif pd.api.types.is_datetime64_any_dtype(series):
+        if pd.api.types.is_datetime64_any_dtype(series):
             col_samples[col] = [str(series.min()), str(series.max())]
+
+        elif pd.api.types.is_numeric_dtype(series):
+            # Random sample of distinct values — more representative than min/median/max
+            unique_vals = series.unique()
+            if len(unique_vals) <= _MAX_SAMPLES_PER_COL:
+                sampled = sorted(unique_vals.tolist())
+            else:
+                # Take a reproducible random sample (seed=0 for consistency)
+                rng_df = pd.Series(unique_vals)
+                sampled = rng_df.sample(
+                    n=_MAX_SAMPLES_PER_COL, random_state=0
+                ).sort_values().tolist()
+            col_samples[col] = [round(float(v), 4) for v in sampled[:_MAX_SAMPLES_PER_COL]]
+
         else:
-            # For categorical/object columns: show most common unique values
+            # Categorical/object: show most frequent values so LLM understands the domain
             unique_vals = series.value_counts().head(_MAX_SAMPLES_PER_COL).index.tolist()
             col_samples[col] = [str(v) for v in unique_vals]
 
@@ -76,10 +95,11 @@ async def query_data(request: QueryRequest) -> QueryResponse:
     Pipeline:
         1. Validate request and look up session DataFrame.
         2. Extract column schema metadata (types + samples).
-        3. Parse the user's intent via Gemini (lightweight call, schema-grounded).
-        4. Run the data engine to produce aggregated results.
-        5. Pass aggregated results + intent to Gemini for plain-language narration.
-        6. Return structured QueryResponse.
+        3. Parse the user's intent via Gemini (schema-grounded, lightweight call).
+        4. Attach the raw question to the intent dict for the data engine.
+        5. Run the data engine to produce aggregated results.
+        6. Pass aggregated results + intent to Gemini for plain-language narration.
+        7. Return structured QueryResponse.
 
     Raises:
         HTTPException 400: Empty question.
@@ -107,9 +127,9 @@ async def query_data(request: QueryRequest) -> QueryResponse:
         # ── Step 1: Extract schema metadata ──────────────────────────────
         col_types, col_samples = _extract_schema_metadata(df)
         logger.info(
-            "Schema extracted: %d columns, types sample: %s",
+            "Schema extracted: %d columns. Types (first 5): %s",
             len(col_types),
-            {k: v for k, v in list(col_types.items())[:5]},
+            dict(list(col_types.items())[:5]),
         )
 
         # ── Step 2: Parse intent (schema-grounded) ────────────────────────
@@ -119,14 +139,16 @@ async def query_data(request: QueryRequest) -> QueryResponse:
             col_types=col_types,
             col_samples=col_samples,
         )
-        # Attach the raw question so the data engine can detect aggregation keywords
+
+        # Attach the raw question so the data engine can use it for
+        # aggregation-keyword detection (e.g. "average", "total", "count")
         intent["question"] = request.question
         logger.info("Intent parsed: %s", intent)
 
         # ── Step 3: Run data engine ───────────────────────────────────────
         engine_result = run_query(df, intent)
         logger.info(
-            "Engine result: analysis_type=%s, metric=%s, groups=%d",
+            "Engine result: analysis_type=%s, metric=%s, n_groups=%d",
             engine_result.get("analysis_type"),
             engine_result.get("metric_used"),
             len(engine_result.get("aggregated_data", {})),
