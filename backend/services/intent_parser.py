@@ -22,13 +22,18 @@ logger = logging.getLogger(__name__)
 # ── Aggregation keyword map ───────────────────────────────────────────────────
 
 _AGG_KEYWORD_MAP: dict[str, str] = {
+    # longest phrases first so "number of" beats "number"
+    "number of": "count", "how many": "count",
     "average": "mean", "avg": "mean", "mean": "mean",
     "total": "sum", "sum": "sum",
-    "count": "count", "number of": "count", "how many": "count",
+    "count": "count",
     "unique": "nunique", "distinct": "nunique",
-    "minimum": "min", "min": "min", "lowest": "min", "smallest": "min",
-    "maximum": "max", "max": "max", "highest": "max", "largest": "max",
+    "minimum": "min", "smallest": "min", "lowest": "min",
+    "maximum": "max", "largest": "max",
     "median": "median",
+    # "highest" / "lowest" without explicit field → aggregation context, not sort
+    # Keep "highest"/"lowest" out of this map; they're handled in post-process
+    # as sort-direction signals, not as pandas agg functions.
 }
 
 # ── Intent classification prompt ──────────────────────────────────────────────
@@ -44,59 +49,66 @@ INTENT DECISION RULES
 1. COMPARE
    Use when the user wants a metric computed SEPARATELY FOR EACH GROUP of a categorical column.
 
-   STRONG signals:
-   - "X per Y"           → "average age per species", "sales per region"
-   - "X for each Y"      → "revenue for each product"
-   - "X for different Y" → "average age for different sex"
-   - "X by Y"            → "revenue by region", "score by grade"
-   - "X across Y"        → "performance across teams"
-   - "X vs Y" (groups)   → "male vs female age"
-   - "which Y has highest/lowest X" → "which species has highest petal length"
+   STRONG signals (any of these → COMPARE):
+   - "X per Y"              → "average age per species"
+   - "X for each Y"         → "revenue for each product"
+   - "X for different Y"    → "average age for different sex"
+   - "X by Y"               → "revenue by region"
+   - "X across Y"           → "performance across teams"
+   - "X vs Y" (groups)      → "male vs female age"
+   - "which Y has highest X"→ "which species has highest petal length"
+   - "compare X by Y"       → "compare sales by region"
+   - "X grouped by Y"       → "purchases grouped by category"
+   - "distribution of X by Y" → "distribution of salary by department"
 
    target_metrics = [the NUMERIC column being measured]
    dimensions = [the CATEGORICAL column doing the grouping]
 
 2. BREAKDOWN
-   Use when the user wants proportions/shares/composition of a total.
-   Signals: "what makes up", "breakdown of", "composition", "proportion", "share", "percentage"
+   Use ONLY when the user explicitly asks for proportions/shares/composition.
+   Signals: "what makes up", "breakdown of", "composition of", "proportion of",
+            "what percentage", "share of total", "how is X divided"
 
 3. CHANGE
-   Use when the user wants to know WHY or HOW something changed over time.
-   Signals: "why did X drop/rise", "what caused", "trend in X over time"
+   Use when the user wants to understand WHY or HOW something changed over time.
+   Signals: "why did X drop/rise", "what caused", "how did X change over time",
+            "trend in X", "increase/decrease in X"
 
 4. SUMMARY
-   Use when none of the above apply — user wants general stats about a column.
-   Signals: "tell me about", "describe", "overview", "stats on", "summarise"
+   Use when none of the above apply — user wants stats about a single column.
+   Signals: "tell me about", "describe", "overview of", "summarise", "stats on X",
+            "what is X like"
 
 EXTRACTION RULES
 ================
 
-target_metrics: NUMERIC columns being measured.
-  - REMOVE aggregation words (average/total/sum/count/mean/max/min) — keep only the base column name.
-  - "average age" → ["Age"]   NOT ["average Age"]
-  - "total sales" → ["Sales"] NOT ["total Sales"]
-  - Use EXACT column names from schema.
-  - Output ["unknown"] only if truly unspecified.
+target_metrics: The NUMERIC column(s) the user is measuring or computing.
+  - Strip aggregation words: "average age" → ["Age"], "total sales" → ["Sales"]
+  - Use EXACT column names from the schema. Capitalisation must match exactly.
+  - If truly unspecified, output ["unknown"].
+  - NEVER put categorical columns here.
 
-dimensions: CATEGORICAL columns used to GROUP or SPLIT the metric.
-  - "per sex" → ["Sex"]
-  - "by region" → ["Region"]
-  - "for different departments" → ["Department"]
-  - NEVER include numeric columns here.
-  - Output [] if no grouping.
+dimensions: The CATEGORICAL column(s) used to GROUP the metric.
+  - "per sex" → ["Sex"], "by region" → ["Region"]
+  - NEVER put numeric columns here.
+  - Output [] if no grouping is requested.
 
-aggregation: The function explicitly stated or strongly implied.
+aggregation: The aggregation explicitly stated.
   - "average" / "mean" → "mean"
   - "total" / "sum" → "sum"
   - "count" / "how many" → "count"
-  - "highest" / "maximum" → "max"
-  - "lowest" / "minimum" → "min"
+  - "highest which group" → "mean"  (ranking by mean, not pandas max)
+  - "lowest which group" → "mean"
   - "median" → "median"
-  - If not stated → null
+  - Not stated → null
 
 time_range: Any time period mentioned, or null.
 
-suggested_chart: "bar" for COMPARE/CHANGE, "pie" for BREAKDOWN ≤8 groups, "bar" for SUMMARY.
+suggested_chart:
+  COMPARE → "bar"
+  BREAKDOWN (≤8 groups) → "pie", else "bar"
+  CHANGE → "bar"
+  SUMMARY (single numeric) → "bar", (time series) → "line"
 
 EXAMPLES
 ========
@@ -106,16 +118,20 @@ Schema: Age (numeric), Sex (categorical: male/female)
 → {"intent":"COMPARE","target_metrics":["Age"],"dimensions":["Sex"],"aggregation":"mean","time_range":null,"suggested_chart":"bar"}
 
 Q: "show me revenue by region"
-Schema: Revenue (numeric), Region (categorical)
+Schema: Revenue (numeric), Region (categorical: North/South/East/West)
 → {"intent":"COMPARE","target_metrics":["Revenue"],"dimensions":["Region"],"aggregation":null,"time_range":null,"suggested_chart":"bar"}
 
 Q: "which species has the highest average petal length"
-Schema: PetalLengthCm (numeric), Species (categorical)
+Schema: PetalLengthCm (numeric), Species (categorical: setosa/versicolor/virginica)
 → {"intent":"COMPARE","target_metrics":["PetalLengthCm"],"dimensions":["Species"],"aggregation":"mean","time_range":null,"suggested_chart":"bar"}
 
 Q: "total sales per product category"
 Schema: Sales (numeric), Category (categorical)
 → {"intent":"COMPARE","target_metrics":["Sales"],"dimensions":["Category"],"aggregation":"sum","time_range":null,"suggested_chart":"bar"}
+
+Q: "what is the survival rate by passenger class"
+Schema: Survived (numeric 0/1), Pclass (numeric 1/2/3)
+→ {"intent":"COMPARE","target_metrics":["Survived"],"dimensions":["Pclass"],"aggregation":"mean","time_range":null,"suggested_chart":"bar"}
 
 Q: "what makes up total revenue?"
 Schema: Revenue (numeric), Category (categorical)
@@ -127,6 +143,10 @@ Q: "why did revenue drop last month?"
 Q: "tell me about the species column"
 Schema: Species (categorical: setosa/versicolor/virginica)
 → {"intent":"SUMMARY","target_metrics":["Species"],"dimensions":[],"aggregation":"count","time_range":null,"suggested_chart":"bar"}
+
+Q: "give me a summary of sepal length"
+Schema: SepalLengthCm (numeric)
+→ {"intent":"SUMMARY","target_metrics":["SepalLengthCm"],"dimensions":[],"aggregation":null,"time_range":null,"suggested_chart":"bar"}
 
 Respond with ONLY a valid JSON object. No markdown, no explanation, no extra text:
 {
@@ -153,7 +173,7 @@ def _build_schema_context(
         sample_str = ", ".join(str(s) for s in samples[:4]) if samples else "—"
         if "int" in dtype or "float" in dtype:
             kind = "numeric"
-        elif dtype in ("object", "category", "string"):
+        elif dtype in ("object", "category", "string") or dtype.startswith("category"):
             kind = "categorical"
         elif "datetime" in dtype or "date" in dtype:
             kind = "datetime"
@@ -176,8 +196,8 @@ def parse_intent(
     Args:
         question: The user's plain-English question.
         available_columns: Column names in the dataset.
-        col_types: column → dtype string.
-        col_samples: column → representative sample values.
+        col_types: column → dtype string (e.g. "float64", "object").
+        col_samples: column → list of representative sample values.
 
     Returns:
         Dict with: intent, target_metrics, dimensions, aggregation,
@@ -217,11 +237,13 @@ def parse_intent(
 # ── Normalisation ─────────────────────────────────────────────────────────────
 
 def _normalise(parsed: dict, available_columns: list[str]) -> dict:
+    """Validate types, coerce legacy fields, and ground column names."""
     valid_intents = {"CHANGE", "COMPARE", "BREAKDOWN", "SUMMARY"}
     parsed["intent"] = parsed.get("intent", "SUMMARY").upper()
     if parsed["intent"] not in valid_intents:
         parsed["intent"] = "SUMMARY"
 
+    # Coerce legacy scalar field name
     if "target_metric" in parsed and "target_metrics" not in parsed:
         parsed["target_metrics"] = [parsed.pop("target_metric")]
     parsed.setdefault("target_metrics", ["unknown"])
@@ -239,14 +261,16 @@ def _normalise(parsed: dict, available_columns: list[str]) -> dict:
     parsed.setdefault("time_range", None)
     parsed.setdefault("suggested_chart", _default_chart(parsed["intent"]))
 
+    # Ground all names to real columns
     parsed["target_metrics"] = _ground_to_columns(parsed["target_metrics"], available_columns)
     parsed["dimensions"] = _ground_to_columns(parsed["dimensions"], available_columns)
+    # Remove any dimension that duplicates a metric
     parsed["dimensions"] = [d for d in parsed["dimensions"] if d not in parsed["target_metrics"]]
 
     return parsed
 
 
-# ── Post-processing ───────────────────────────────────────────────────────────
+# ── Post-processing (deterministic corrections) ───────────────────────────────
 
 def _post_process(
     parsed: dict,
@@ -254,14 +278,16 @@ def _post_process(
     available_columns: list[str],
     col_types: dict[str, str],
 ) -> dict:
-    """Deterministic corrections applied after LLM classification.
+    """Rule-based corrections that run after LLM classification.
 
-    Fixes the most common failure modes:
-    1. Grouping phrases ("per/by/for each/for different") → force COMPARE
-    2. Superlative phrases ("which X has highest Y") → force COMPARE
-    3. Numeric/categorical swap between metrics and dimensions
-    4. Aggregation keyword extraction from raw question text
-    5. Missing numeric metric in COMPARE queries
+    Fixes:
+    1. Explicit aggregation extraction from raw question text
+    2. Grouping phrases (per/by/for each/for different/across) → COMPARE
+    3. Superlative phrases (which X has highest/lowest Y) → COMPARE with sort hint
+    4. Numeric↔categorical swap between target_metrics and dimensions
+    5. "highest/lowest" as aggregation context → use mean + set sort_desc hint
+    6. Missing numeric metric in COMPARE → infer from question tokens
+    7. Strip "unknown" placeholders when real columns were found
     """
     q_lower = question.lower()
 
@@ -280,20 +306,25 @@ def _post_process(
         parsed["aggregation"] = _extract_agg_keyword(q_lower)
 
     # ── 2. Detect grouping phrases → COMPARE ──────────────────────────────
+    # Patterns that signal "compute metric separately for each group"
     grouping_patterns = [
-        r"\bper\s+([\w\s]{2,30}?)(?:\s*$|\s*\?|\s+and\b|\s+or\b)",
-        r"\bby\s+([\w\s]{2,30}?)(?:\s*$|\s*\?|\s+and\b|\s+or\b)",
-        r"\bfor\s+(?:each|different|every|various)\s+([\w\s]{2,25}?)(?:\s*$|\s*\?)",
-        r"\bacross\s+(?:different\s+)?([\w\s]{2,25}?)(?:\s*$|\s*\?)",
-        r"\bamong\s+(?:different\s+)?([\w\s]{2,25}?)(?:\s*$|\s*\?)",
-        r"\bgrouped?\s+by\s+([\w\s]{2,25}?)(?:\s*$|\s*\?)",
-        r"\bfor\s+([\w\s]{2,25}?)\s+(?:groups?|categories|segments?|types?)",
+        r"\bper\s+([\w][\w\s]{1,28}?)(?=\s*$|\s*\?|\s+and\b|\s+or\b)",
+        r"\bby\s+([\w][\w\s]{1,28}?)(?=\s*$|\s*\?|\s+and\b|\s+or\b)",
+        r"\bfor\s+(?:each|different|every|various)\s+([\w][\w\s]{1,24}?)(?=\s*$|\s*\?)",
+        r"\bacross\s+(?:different\s+)?([\w][\w\s]{1,24}?)(?=\s*$|\s*\?)",
+        r"\bamong\s+(?:different\s+)?([\w][\w\s]{1,24}?)(?=\s*$|\s*\?)",
+        r"\bgrouped?\s+by\s+([\w][\w\s]{1,24}?)(?=\s*$|\s*\?)",
+        r"\bcompare\s+[\w\s]+\s+by\s+([\w][\w\s]{1,24}?)(?=\s*$|\s*\?)",
+        r"\bdistribution\s+of\s+[\w\s]+\s+by\s+([\w][\w\s]{1,24}?)(?=\s*$|\s*\?)",
     ]
     found_dim: str | None = None
     for pattern in grouping_patterns:
         m = re.search(pattern, q_lower)
         if m:
             phrase = m.group(1).strip().rstrip("?").strip()
+            # Require phrase is at least 2 chars to avoid single-letter false matches
+            if len(phrase) < 2:
+                continue
             col = _match_column_phrase(phrase, available_columns)
             if col and col in categorical_cols:
                 found_dim = col
@@ -307,13 +338,17 @@ def _post_process(
         if found_dim in parsed["target_metrics"]:
             parsed["target_metrics"] = [m for m in parsed["target_metrics"] if m != found_dim]
 
-    # ── 3. Superlative phrases → COMPARE ──────────────────────────────────
+    # ── 3. Superlative phrases → COMPARE with descending/ascending sort ────
+    # "which species has highest petal length" → COMPARE, sort desc
+    # "which region has lowest churn" → COMPARE, sort asc
     superlative_re = re.search(
-        r"\bwhich\s+([\w\s]{2,25}?)\s+(?:has|have|is|are)\s+(?:the\s+)?(?:highest|lowest|most|least|best|worst|largest|smallest|maximum|minimum)\b",
+        r"\bwhich\s+([\w][\w\s]{1,24}?)\s+(?:has|have|is|are)\s+"
+        r"(?:the\s+)?(?P<dir>highest|largest|most|best|lowest|smallest|least|worst|maximum|minimum)\b",
         q_lower,
     )
     if superlative_re:
         dim_phrase = superlative_re.group(1).strip()
+        direction = superlative_re.group("dir")
         dim_col = _match_column_phrase(dim_phrase, available_columns)
         if dim_col and dim_col in categorical_cols:
             parsed["intent"] = "COMPARE"
@@ -322,19 +357,23 @@ def _post_process(
                 parsed["dimensions"] = [dim_col] + [d for d in parsed["dimensions"] if d != dim_col]
             if dim_col in parsed["target_metrics"]:
                 parsed["target_metrics"] = [m for m in parsed["target_metrics"] if m != dim_col]
+            # "highest/most" → sort descending; "lowest/least" → ascending
+            parsed["sort_desc"] = direction in ("highest", "largest", "most", "best", "maximum")
+            # Force mean aggregation for ranking questions (not raw pandas max/min)
+            if not parsed.get("aggregation"):
+                parsed["aggregation"] = "mean"
 
     # ── 4. Fix numeric↔categorical swap ───────────────────────────────────
-    # If a categorical col ended up in target_metrics, move it to dimensions
-    # If a numeric col ended up in dimensions, move it to target_metrics
-    corrected_metrics = []
-    corrected_dims = list(parsed["dimensions"])
+    # Categorical col in target_metrics → move to dimensions (unless SUMMARY)
+    # Numeric col in dimensions → move to target_metrics
+    corrected_metrics: list[str] = []
+    corrected_dims: list[str] = list(parsed["dimensions"])
 
     for m in parsed["target_metrics"]:
         if m in categorical_cols and m not in corrected_dims:
             corrected_dims.insert(0, m)
-            if parsed["intent"] == "SUMMARY":
-                pass  # keep SUMMARY for "tell me about Species"
-            else:
+            # Only force COMPARE if intent wasn't deliberately SUMMARY
+            if parsed["intent"] != "SUMMARY":
                 parsed["intent"] = "COMPARE"
         else:
             corrected_metrics.append(m)
@@ -349,7 +388,7 @@ def _post_process(
     parsed["dimensions"] = list(dict.fromkeys(corrected_dims))
     parsed["dimensions"] = [d for d in parsed["dimensions"] if d not in parsed["target_metrics"]]
 
-    # ── 5. COMPARE with no numeric metric → infer from question ───────────
+    # ── 5. COMPARE with no numeric metric → infer from question tokens ─────
     if parsed["intent"] == "COMPARE":
         if not _has_numeric_metric(parsed["target_metrics"], numeric_cols):
             best = _infer_numeric_metric(q_lower, available_columns, numeric_cols)
@@ -367,6 +406,7 @@ def _post_process(
 # ── Utilities ─────────────────────────────────────────────────────────────────
 
 def _safe_parse_json(raw: str) -> dict:
+    """Best-effort JSON extraction from a Gemini response string."""
     text = raw
     if "```json" in text:
         text = text.split("```json", 1)[1]
@@ -396,6 +436,7 @@ def _normalize_str(s: str) -> str:
 
 
 def _ground_to_columns(names: list[str], available_columns: list[str]) -> list[str]:
+    """Map AI-extracted names to closest actual column names."""
     col_exact = {c: c for c in available_columns}
     col_lower = {c.lower(): c for c in available_columns}
     col_norm = {_normalize_str(c): c for c in available_columns}
@@ -410,7 +451,7 @@ def _ground_to_columns(names: list[str], available_columns: list[str]) -> list[s
             col_exact.get(name)
             or col_lower.get(name.lower())
             or col_norm.get(_normalize_str(name))
-            or name
+            or name  # keep for downstream fuzzy matching
         )
         if resolved not in seen:
             grounded.append(resolved)
@@ -419,17 +460,31 @@ def _ground_to_columns(names: list[str], available_columns: list[str]) -> list[s
 
 
 def _match_column_phrase(phrase: str, available_columns: list[str]) -> str | None:
+    """Match a free-text phrase to the closest column name.
+
+    Uses exact → substring (with minimum length guard) → token overlap.
+    """
     phrase_norm = _normalize_str(phrase)
+    if not phrase_norm:
+        return None
     col_norm_map = {_normalize_str(c): c for c in available_columns}
+
+    # 1. Exact normalized match
     if phrase_norm in col_norm_map:
         return col_norm_map[phrase_norm]
+
+    # 2. Substring — only when the shorter string is ≥3 chars to avoid noise
     for cn, col in col_norm_map.items():
-        if phrase_norm in cn or cn in phrase_norm:
+        shorter = phrase_norm if len(phrase_norm) <= len(cn) else cn
+        if len(shorter) >= 3 and (phrase_norm in cn or cn in phrase_norm):
             return col
-    phrase_tokens = set(re.findall(r"[a-z0-9]+", phrase_norm))
+
+    # 3. Token overlap — require at least 1 meaningful token match
+    phrase_tokens = set(re.findall(r"[a-z]{2,}", phrase_norm))  # ≥2 chars per token
     best_col, best_score = None, 0
     for cn, col in col_norm_map.items():
-        score = len(phrase_tokens & set(re.findall(r"[a-z0-9]+", cn)))
+        col_tokens = set(re.findall(r"[a-z]{2,}", cn))
+        score = len(phrase_tokens & col_tokens)
         if score > best_score:
             best_score, best_col = score, col
     return best_col if best_score > 0 else None
@@ -439,20 +494,24 @@ def _has_numeric_metric(metrics: list[str], numeric_cols: set[str]) -> bool:
     return any(m in numeric_cols for m in metrics)
 
 
-def _infer_numeric_metric(q_lower: str, available_columns: list[str], numeric_cols: set[str]) -> str | None:
-    q_tokens = set(re.findall(r"[a-z0-9]+", q_lower))
+def _infer_numeric_metric(
+    q_lower: str, available_columns: list[str], numeric_cols: set[str]
+) -> str | None:
+    """Guess the most likely numeric metric by token overlap with question."""
+    q_tokens = set(re.findall(r"[a-z]{2,}", q_lower))  # ≥2 chars
     best_col, best_score = None, 0
     for col in available_columns:
         if col not in numeric_cols:
             continue
-        col_tokens = set(re.findall(r"[a-z0-9]+", _normalize_str(col)))
+        col_tokens = set(re.findall(r"[a-z]{2,}", _normalize_str(col)))
         score = len(q_tokens & col_tokens)
         if score > best_score:
             best_score, best_col = score, col
-    return best_col
+    return best_col if best_score > 0 else None  # explicit score guard
 
 
 def _extract_agg_keyword(q_lower: str) -> str | None:
+    """Extract an explicit aggregation keyword from the question (longest match first)."""
     for phrase in sorted(_AGG_KEYWORD_MAP, key=len, reverse=True):
         if phrase in q_lower:
             return _AGG_KEYWORD_MAP[phrase]
