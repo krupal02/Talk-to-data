@@ -32,14 +32,18 @@ def _tokenize(s: str) -> set[str]:
     return set(re.findall(r"[a-z0-9]+", spaced.lower()))
 
 
-_ID_LIKE = {"id", "index", "idx", "uid", "unnamed0", "rowid", "row"}
+_ID_LIKE = {"id", "index", "idx", "uid", "unnamed0", "rowid", "row", "no", "num", "number", "sr", "sl"}
+
 
 def _is_id_column(col_name: str) -> bool:
+    """Return True if the column looks like a surrogate key / row index."""
     norm = _normalize(col_name)
     if norm in _ID_LIKE:
         return True
     tokens = _tokenize(col_name)
-    if "id" in tokens or "idx" in tokens or "uid" in tokens or "index" in tokens:
+    # Must be more than just an ID token — e.g. "passenger_id" but not "student_grade"
+    id_tokens = {"id", "idx", "uid", "index"}
+    if tokens and tokens.issubset(id_tokens | {"unnamed", "row", "no", "num", "number", "sr", "sl"}):
         return True
     return False
 
@@ -58,28 +62,26 @@ def _find_best_column(df: pd.DataFrame, metric_name: str) -> str | None:
     if norm_target in col_norm_map:
         return col_norm_map[norm_target]
 
-    # 2. Semantic-layer canonical name
+    # 2. Semantic-layer canonical name + aliases
     resolved = resolve_metric(metric_name)
     if resolved:
-        canon_norm = _normalize(resolved["canonical_name"])
-        if canon_norm in col_norm_map:
-            return col_norm_map[canon_norm]
-        # Also try aliases
-        for alias in resolved.get("aliases", []):
-            alias_norm = _normalize(alias)
-            if alias_norm in col_norm_map:
-                return col_norm_map[alias_norm]
+        for candidate in [resolved["canonical_name"]] + resolved.get("aliases", []):
+            cn = _normalize(candidate)
+            if cn in col_norm_map:
+                return col_norm_map[cn]
 
-    # 3. Substring match (target contained in column or vice-versa)
+    # 3. Substring match — require the shorter string to be ≥3 chars
     for col_norm, col_original in col_norm_map.items():
-        if norm_target in col_norm or col_norm in norm_target:
+        shorter = norm_target if len(norm_target) <= len(col_norm) else col_norm
+        if len(shorter) >= 3 and (norm_target in col_norm or col_norm in norm_target):
             return col_original
 
-    # 4. Token-intersection fallback
-    metric_tokens = _tokenize(metric_name)
+    # 4. Token-intersection fallback (≥1 shared token of ≥2 chars)
+    metric_tokens = {t for t in _tokenize(metric_name) if len(t) >= 2}
     best_col, best_score = None, 0
     for col in df.columns:
-        score = len(metric_tokens & _tokenize(col))
+        col_tokens = {t for t in _tokenize(col) if len(t) >= 2}
+        score = len(metric_tokens & col_tokens)
         if score > best_score:
             best_score, best_col = score, col
 
@@ -92,16 +94,17 @@ def _find_dimension_columns(df: pd.DataFrame, dimensions: list[str]) -> list[str
     col_norm_map = {_normalize(c): c for c in df.columns}
     for dim in dimensions:
         dim_norm = _normalize(dim)
-        if not dim_norm:
+        if not dim_norm or len(dim_norm) < 2:
             continue
         if dim_norm in col_norm_map:
             matched.append(col_norm_map[dim_norm])
         else:
             for col_norm, col_original in col_norm_map.items():
-                if dim_norm in col_norm or col_norm in dim_norm:
+                shorter = dim_norm if len(dim_norm) <= len(col_norm) else col_norm
+                if len(shorter) >= 3 and (dim_norm in col_norm or col_norm in dim_norm):
                     matched.append(col_original)
                     break
-    # Deduplicate
+    # Deduplicate preserving order
     seen, result = set(), []
     for c in matched:
         if c not in seen:
@@ -120,87 +123,95 @@ def _best_numeric_column(df: pd.DataFrame, exclude: list[str] | None = None) -> 
     return candidates[0] if candidates else None
 
 
-def _best_category_columns(df: pd.DataFrame, exclude: list[str] | None = None, max_cols: int = 2) -> list[str]:
+def _best_category_columns(
+    df: pd.DataFrame, exclude: list[str] | None = None, max_cols: int = 2
+) -> list[str]:
     """Return non-numeric columns suitable for grouping (≤50 unique values)."""
     exclude = set(exclude or [])
     cats = [
         c for c in df.columns
         if c not in exclude
         and not _is_id_column(c)
-        and (df[c].dtype == "object" or str(df[c].dtype) == "category")
+        and (df[c].dtype == "object" or str(df[c].dtype).startswith("category"))
         and df[c].nunique() <= 50
     ]
     return cats[:max_cols]
 
 
 def _detect_time_column(df: pd.DataFrame) -> str | None:
-    """Heuristically identify a date/time column."""
+    """Identify a date/time column, avoiding false positives.
+
+    Only matches datetime-typed columns or columns whose name contains
+    a time keyword as a whole token (not just a substring).
+    """
     for col in df.columns:
         if pd.api.types.is_datetime64_any_dtype(df[col]):
             return col
-        norm = _normalize(col)
-        if any(kw in norm for kw in ("date", "time", "month", "year", "week", "day", "period")):
+    # Check by name — require the keyword to be a standalone token
+    time_keywords = {"date", "time", "month", "year", "week", "period", "timestamp"}
+    for col in df.columns:
+        tokens = set(_tokenize(col))
+        if tokens & time_keywords:
             return col
     return None
 
 
+# ── Aggregation resolution ────────────────────────────────────────────────────
+
 _AGG_KEYWORD_MAP = {
-    # mean / average
+    "number of": "count", "how many": "count",
     "average": "mean", "avg": "mean", "mean": "mean",
-    # sum / total
     "total": "sum", "sum": "sum",
-    # count
-    "count": "count", "number of": "count", "how many": "count",
-    # unique
+    "count": "count",
     "unique": "nunique", "distinct": "nunique",
-    # min / max
-    "minimum": "min", "min": "min", "lowest": "min", "smallest": "min",
-    "maximum": "max", "max": "max", "highest": "max", "largest": "max",
-    # median
-    "median": "median", "middle": "median",
+    "minimum": "min", "smallest": "min", "lowest": "min",
+    "maximum": "max", "largest": "max",
+    "median": "median",
 }
 
 
 def _extract_agg_from_question(question: str) -> str | None:
-    """Return an explicit aggregation function if the question states one clearly."""
+    """Return an explicit aggregation function from the question (longest-match first)."""
     q = question.lower()
-    # Longest-match first to catch "number of" before "number"
     for phrase in sorted(_AGG_KEYWORD_MAP, key=len, reverse=True):
         if phrase in q:
             return _AGG_KEYWORD_MAP[phrase]
     return None
 
 
-def _resolve_agg(df: pd.DataFrame, metric_col: str, metric_name: str, question: str = "", intent_agg: str | None = None) -> str:
+def _resolve_agg(
+    df: pd.DataFrame,
+    metric_col: str,
+    metric_name: str,
+    question: str = "",
+    intent_agg: str | None = None,
+) -> str:
     """Choose the correct aggregation function for a column.
 
     Priority:
-      1. Explicit aggregation extracted by the intent parser (intent_agg field)
-      2. Explicit aggregation word found in the raw question text
-      3. Semantic-layer definition for the metric
+      1. intent_agg — explicit aggregation extracted by the intent parser
+      2. Question keyword scan
+      3. Semantic-layer definition
       4. Default: "sum" for numeric, "nunique" for categorical
     """
     def _guard(agg: str) -> str:
-        """Ensure aggregation is compatible with column dtype."""
         if not pd.api.types.is_numeric_dtype(df[metric_col].dropna()):
             return "nunique"
+        # pandas doesn't have a "median" groupby agg by name for some versions
+        # — it does since pandas 1.1, so this is safe
         return agg
 
-    # 1. Intent parser already extracted the aggregation — highest trust
-    if intent_agg and intent_agg not in (None, "null", ""):
+    if intent_agg and intent_agg not in (None, "null", "none", ""):
         return _guard(intent_agg)
 
-    # 2. Keyword scan of raw question
     if question:
         explicit = _extract_agg_from_question(question)
         if explicit:
             return _guard(explicit)
 
-    # 3. Semantic-layer definition
     resolved = resolve_metric(metric_name)
     agg_func = resolved["aggregation"] if resolved else "sum"
 
-    # 4. Dtype guard
     if not pd.api.types.is_numeric_dtype(df[metric_col].dropna()):
         agg_func = "nunique" if agg_func == "sum" else "count"
 
@@ -208,17 +219,15 @@ def _resolve_agg(df: pd.DataFrame, metric_col: str, metric_name: str, question: 
 
 
 def _source_ref(df: pd.DataFrame, cols: list[str]) -> str:
-    col_str = ", ".join(cols) if cols else "all columns"
+    col_str = ", ".join(c for c in cols if c) or "all columns"
     return f"rows 1–{len(df):,}, column(s): {col_str}"
 
 
 # ── Intent handlers ───────────────────────────────────────────────────────────
 
 def handle_change(df: pd.DataFrame, intent: dict) -> dict[str, Any]:
-    """CHANGE – show how a metric is distributed across groups, with delta context.
-
-    When a time column exists, computes an actual period-over-period delta.
-    Otherwise ranks groups by the metric so the biggest contributors are clear.
+    """CHANGE – compute period-over-period delta when a time column exists,
+    otherwise rank groups by the metric value.
     """
     primary_metric = intent.get("target_metrics", ["unknown"])[0]
     metric_col = _find_best_column(df, primary_metric) or _best_numeric_column(df)
@@ -241,11 +250,12 @@ def handle_change(df: pd.DataFrame, intent: dict) -> dict[str, Any]:
         try:
             df2 = df.copy()
             df2[time_col] = pd.to_datetime(df2[time_col], errors="coerce")
-            df2 = df2.dropna(subset=[time_col])
+            df2 = df2.dropna(subset=[time_col]).sort_values(time_col)
 
-            midpoint = df2[time_col].median()
-            period_a = df2[df2[time_col] <= midpoint]
-            period_b = df2[df2[time_col] > midpoint]
+            # Split by row position (not median timestamp) for correctness
+            mid = len(df2) // 2
+            period_a = df2.iloc[:mid]
+            period_b = df2.iloc[mid:]
 
             if dim_cols:
                 group_col = dim_cols[0]
@@ -273,11 +283,12 @@ def handle_change(df: pd.DataFrame, intent: dict) -> dict[str, Any]:
                     "metric_used": metric_label,
                     "chart_hint": "bar",
                     "analysis_type": "period_over_period",
+                    "group_col": group_col,
                 }
         except Exception:
             logger.debug("Period-over-period failed, falling back to group ranking.", exc_info=True)
 
-    # ── Fallback: rank groups by metric value ────────────────────────────
+    # ── Fallback: rank groups by metric value ─────────────────────────────
     if dim_cols:
         group_col = dim_cols[0]
         grouped = df.groupby(group_col)[metric_col].agg(agg_func).sort_values(ascending=False)
@@ -296,14 +307,15 @@ def handle_change(df: pd.DataFrame, intent: dict) -> dict[str, Any]:
         "metric_used": metric_label,
         "chart_hint": "bar",
         "analysis_type": "group_ranking",
+        "group_col": dim_cols[0] if dim_cols else None,
     }
 
 
 def handle_compare(df: pd.DataFrame, intent: dict) -> dict[str, Any]:
-    """COMPARE – side-by-side comparison of groups across one or more metrics.
+    """COMPARE – compute a metric for each group of a categorical dimension.
 
-    If multiple target metrics are specified, each is computed for every group.
-    The result includes absolute values and relative difference from the leader.
+    The result shows each group's value; the leader row is omitted from
+    diff_from_leader to avoid a redundant zero entry.
     """
     target_metrics = intent.get("target_metrics", ["unknown"])
     dim_cols = _find_dimension_columns(df, intent.get("dimensions", []))
@@ -324,50 +336,70 @@ def handle_compare(df: pd.DataFrame, intent: dict) -> dict[str, Any]:
     if not dim_cols:
         dim_cols = _best_category_columns(df, exclude=metric_cols)
 
-    primary_metric_col = metric_cols[0]
     question = intent.get("question", "")
     intent_agg = intent.get("aggregation") or None
+    sort_desc = intent.get("sort_desc", True)
+
+    primary_metric_col = metric_cols[0]
     agg_func = _resolve_agg(df, primary_metric_col, target_metrics[0], question, intent_agg)
 
     if dim_cols:
         group_col = dim_cols[0]
-        frames = {}
+        frames: dict[str, pd.Series] = {}
         for mc in metric_cols:
             af = _resolve_agg(df, mc, mc, question, intent_agg)
             frames[mc] = df.groupby(group_col)[mc].agg(af)
 
-        result_df = pd.DataFrame(frames).fillna(0).sort_values(primary_metric_col, ascending=False)
+        result_df = (
+            pd.DataFrame(frames)
+            .fillna(0)
+            .sort_values(primary_metric_col, ascending=not sort_desc)
+        )
         top = result_df.head(10)
-        leader_val = top[primary_metric_col].iloc[0] if len(top) else 1
+        leader_val = float(top[primary_metric_col].iloc[0]) if len(top) else None
 
-        aggregated_data = {}
-        for group_val, row in top.iterrows():
-            entry = {}
+        aggregated_data: dict[str, Any] = {}
+        for i, (group_val, row) in enumerate(top.iterrows()):
+            entry: dict[str, Any] = {}
             for mc in metric_cols:
                 entry[mc] = round(float(row[mc]), 2)
-            if leader_val and primary_metric_col in entry:
-                diff_from_leader = round(entry[primary_metric_col] - float(leader_val), 2)
-                entry["diff_from_leader"] = diff_from_leader
+            # diff_from_leader: skip the leader itself (diff = 0 is noise)
+            if i > 0 and leader_val is not None:
+                entry["diff_from_leader"] = round(entry[primary_metric_col] - leader_val, 2)
             aggregated_data[str(group_val)] = entry
+
+        metric_label = ", ".join(
+            f"{c} ({_resolve_agg(df, c, c, question, intent_agg)})" for c in metric_cols
+        )
     else:
-        # No grouping dimension – compare the metrics against each other
+        # No grouping dimension — compare metrics against each other
         aggregated_data = {}
         for mc in metric_cols:
             af = _resolve_agg(df, mc, mc, question, intent_agg)
             val = df[mc].agg(af)
             aggregated_data[mc] = {"value": round(float(val), 2)}
+        metric_label = ", ".join(
+            f"{c} ({_resolve_agg(df, c, c, question, intent_agg)})" for c in metric_cols
+        )
 
     return {
         "aggregated_data": aggregated_data,
         "source_ref": _source_ref(df, metric_cols + dim_cols[:1]),
-        "metric_used": ", ".join(f"{c} ({_resolve_agg(df, c, c, question, intent_agg)})" for c in metric_cols),
+        "metric_used": metric_label,
         "chart_hint": "bar",
         "analysis_type": "comparison",
+        "group_col": dim_cols[0] if dim_cols else None,
+        "agg_func": agg_func,
     }
 
 
 def handle_breakdown(df: pd.DataFrame, intent: dict) -> dict[str, Any]:
-    """BREAKDOWN – decompose a metric by one or more dimensions with percentages."""
+    """BREAKDOWN – decompose a metric by one dimension with percentage shares.
+
+    Percentages are computed relative to the total of the aggregated values,
+    which is only meaningful when agg_func is sum or count.
+    For mean/median, percentages are omitted to avoid misleading numbers.
+    """
     primary_metric = intent.get("target_metrics", ["unknown"])[0]
     metric_col = _find_best_column(df, primary_metric) or _best_numeric_column(df)
     if metric_col is None:
@@ -377,49 +409,63 @@ def handle_breakdown(df: pd.DataFrame, intent: dict) -> dict[str, Any]:
     if not dim_cols:
         dim_cols = _best_category_columns(df, exclude=[metric_col])
 
-    agg_func = _resolve_agg(df, metric_col, primary_metric, intent.get("question", ""), intent.get("aggregation") or None)
+    agg_func = _resolve_agg(
+        df, metric_col, primary_metric,
+        intent.get("question", ""), intent.get("aggregation") or None
+    )
     metric_label = f"{metric_col} ({agg_func})"
+
+    # Percentage shares are only sensible for additive aggregations
+    show_pct = agg_func in ("sum", "count", "nunique")
 
     if dim_cols:
         group_col = dim_cols[0]
         grouped = df.groupby(group_col)[metric_col].agg(agg_func).sort_values(ascending=False)
-        total = grouped.sum()
         n_groups = len(grouped)
+        total = grouped.sum() if show_pct else None
 
-        aggregated_data = {}
+        aggregated_data: dict[str, Any] = {}
         for k, v in grouped.head(10).items():
-            pct = round((v / total) * 100, 1) if total else 0
-            aggregated_data[str(k)] = {"value": round(float(v), 2), "percentage": pct}
+            entry: dict[str, Any] = {"value": round(float(v), 2)}
+            if show_pct and total:
+                entry["percentage"] = round((v / total) * 100, 1)
+            aggregated_data[str(k)] = entry
 
-        # Append "Other" bucket if more than 10 groups
-        if n_groups > 10:
+        # "Other" bucket when there are more than 10 groups
+        if n_groups > 10 and show_pct and total:
             other_sum = float(grouped.iloc[10:].sum())
-            other_pct = round((other_sum / total) * 100, 1) if total else 0
-            aggregated_data["Other"] = {"value": round(other_sum, 2), "percentage": other_pct}
+            aggregated_data["Other"] = {
+                "value": round(other_sum, 2),
+                "percentage": round((other_sum / total) * 100, 1),
+            }
 
-        # Include secondary dimension if present
+        # Optional secondary dimension
         secondary_data: dict | None = None
         if len(dim_cols) >= 2:
             group_col_2 = dim_cols[1]
             grouped2 = df.groupby(group_col_2)[metric_col].agg(agg_func).sort_values(ascending=False)
-            total2 = grouped2.sum()
-            secondary_data = {
-                str(k): {"value": round(float(v), 2), "percentage": round((v / total2) * 100, 1) if total2 else 0}
-                for k, v in grouped2.head(8).items()
-            }
+            total2 = grouped2.sum() if show_pct else None
+            secondary_data = {}
+            for k, v in grouped2.head(8).items():
+                entry2: dict[str, Any] = {"value": round(float(v), 2)}
+                if show_pct and total2:
+                    entry2["percentage"] = round((v / total2) * 100, 1)
+                secondary_data[str(k)] = entry2
     else:
-        total = df[metric_col].agg(agg_func)
-        aggregated_data = {"total": {"value": round(float(total), 2), "percentage": 100.0}}
+        total_val = df[metric_col].agg(agg_func)
+        aggregated_data = {"total": {"value": round(float(total_val), 2), "percentage": 100.0}}
         secondary_data = None
+        n_groups = 1
 
-    result = {
+    result: dict[str, Any] = {
         "aggregated_data": aggregated_data,
         "source_ref": _source_ref(df, [metric_col] + dim_cols),
         "metric_used": metric_label,
-        "chart_hint": "pie" if (dim_cols and len(aggregated_data) <= 8) else "bar",
+        "chart_hint": "pie" if (dim_cols and len(aggregated_data) <= 8 and show_pct) else "bar",
         "analysis_type": "breakdown",
         "group_col": dim_cols[0] if dim_cols else None,
-        "total_groups": n_groups if dim_cols else 1,
+        "total_groups": n_groups,
+        "show_pct": show_pct,
     }
     if secondary_data:
         result["secondary_breakdown"] = secondary_data
@@ -428,46 +474,44 @@ def handle_breakdown(df: pd.DataFrame, intent: dict) -> dict[str, Any]:
 
 
 def handle_summary(df: pd.DataFrame, intent: dict) -> dict[str, Any]:
-    """SUMMARY – rich descriptive statistics for all requested metrics.
+    """SUMMARY – descriptive statistics for requested metrics.
 
-    Always returns a consistent dict shape: one key per metric column,
-    each containing a stats sub-dict. This prevents the shape-switching
-    that confused the Gemini prompts in the original implementation.
+    Always returns {column_name: {stats}} so the shape is consistent.
 
-    Special case: if the user mentions a categorical column (e.g. "tell me about
-    the species column"), redirect to a frequency breakdown of that column so the
-    answer is actually useful instead of falling back to unrelated numeric stats.
+    Special case: if the user asks about a categorical column (e.g. "tell me
+    about the species column"), return a frequency breakdown of that column.
     """
     target_metrics = intent.get("target_metrics", ["unknown"])
 
-    # Resolve all requested metric columns
     metric_cols: list[str] = []
-    cat_cols: list[str] = []          # categorical columns mentioned by the user
+    cat_cols: list[str] = []
+
     for m in target_metrics:
         col = _find_best_column(df, m)
-        if col and col not in metric_cols:
+        if col:
             if pd.api.types.is_numeric_dtype(df[col].dropna()):
-                metric_cols.append(col)
+                if col not in metric_cols:
+                    metric_cols.append(col)
             else:
-                cat_cols.append(col)  # user asked about a categorical column
+                if col not in cat_cols:
+                    cat_cols.append(col)
 
-    # If the user specifically asked about a categorical column, give a
-    # frequency breakdown of it rather than dumping unrelated numeric stats.
+    # Redirect categorical-column questions to a frequency breakdown
     if cat_cols and not metric_cols:
         cat_col = cat_cols[0]
         series = df[cat_col].dropna()
         top_vals = series.value_counts().head(10)
         total = len(series)
+        n_groups = series.nunique()
         aggregated_data = {
             str(k): {"count": int(v), "percentage": round((v / total) * 100, 1)}
             for k, v in top_vals.items()
         }
-        n_groups = series.nunique()
-        other_count = total - int(top_vals.sum())
-        if other_count > 0:
+        remaining = total - int(top_vals.sum())
+        if remaining > 0:
             aggregated_data["Other"] = {
-                "count": other_count,
-                "percentage": round((other_count / total) * 100, 1),
+                "count": remaining,
+                "percentage": round((remaining / total) * 100, 1),
             }
         return {
             "aggregated_data": aggregated_data,
@@ -479,15 +523,18 @@ def handle_summary(df: pd.DataFrame, intent: dict) -> dict[str, Any]:
             "total_groups": n_groups,
         }
 
+    # Fallback to all non-ID numeric columns when target is unspecified
     if not metric_cols:
-        numeric_cols = [
+        metric_cols = [
             c for c in df.select_dtypes(include="number").columns
             if not _is_id_column(c)
-        ]
-        metric_cols = numeric_cols[:4] if numeric_cols else []
+        ][:4]
 
     if not metric_cols:
         return _fallback_summary(df)
+
+    # Detect time column once for trend analysis
+    time_col = _detect_time_column(df)
 
     aggregated_data: dict[str, dict] = {}
     for col in metric_cols:
@@ -505,28 +552,34 @@ def handle_summary(df: pd.DataFrame, intent: dict) -> dict[str, Any]:
                 "max": round(float(series.max()), 2),
                 "std_dev": round(float(series.std()), 2) if len(series) > 1 else 0.0,
             }
-            # Outlier count: values beyond 2 std devs
+
+            # Outliers: values beyond 2 standard deviations
             mean, std = series.mean(), series.std()
             if std > 0:
                 stats["outlier_count"] = int(((series - mean).abs() > 2 * std).sum())
 
-            # Trend direction from first vs second half
-            if len(series) >= 6:
-                mid = len(series) // 2
-                first_half_mean = float(series.iloc[:mid].mean())
-                second_half_mean = float(series.iloc[mid:].mean())
-                pct_change = (
-                    ((second_half_mean - first_half_mean) / abs(first_half_mean)) * 100
-                    if first_half_mean != 0 else 0.0
-                )
-                stats["trend"] = (
-                    "increasing" if pct_change > 2
-                    else "decreasing" if pct_change < -2
-                    else "stable"
-                )
-                stats["trend_pct_change"] = round(pct_change, 1)
+            # Trend: only meaningful when a time column exists and data is sortable
+            if time_col and time_col in df.columns and len(series) >= 6:
+                try:
+                    sorted_series = (
+                        df[[time_col, col]]
+                        .dropna()
+                        .sort_values(time_col)[col]
+                    )
+                    mid = len(sorted_series) // 2
+                    first_half_mean = float(sorted_series.iloc[:mid].mean())
+                    second_half_mean = float(sorted_series.iloc[mid:].mean())
+                    if first_half_mean != 0:
+                        pct_change = ((second_half_mean - first_half_mean) / abs(first_half_mean)) * 100
+                        stats["trend"] = (
+                            "increasing" if pct_change > 2
+                            else "decreasing" if pct_change < -2
+                            else "stable"
+                        )
+                        stats["trend_pct_change"] = round(pct_change, 1)
+                except Exception:
+                    pass  # non-critical; skip trend for this column
         else:
-            # Categorical column
             top_vals = series.value_counts().head(5)
             stats = {
                 "count": int(len(series)),
@@ -540,13 +593,11 @@ def handle_summary(df: pd.DataFrame, intent: dict) -> dict[str, Any]:
     if not aggregated_data:
         return _fallback_summary(df)
 
-    # Use grouped_bar when multiple numeric metrics are present so the frontend
-    # can render one group per metric (mean/min/max bars side-by-side), keeping
-    # the x-axis clean. Single-metric summaries stay as plain bar.
-    chart_hint = "grouped_bar" if len([c for c in metric_cols if c in aggregated_data and "mean" in aggregated_data[c]]) > 1 else "bar"
+    numeric_with_mean = [c for c in metric_cols if c in aggregated_data and "mean" in aggregated_data[c]]
+    chart_hint = "grouped_bar" if len(numeric_with_mean) > 1 else "bar"
 
     return {
-        "aggregated_data": aggregated_data,  # Always keyed by column name
+        "aggregated_data": aggregated_data,
         "source_ref": _source_ref(df, metric_cols),
         "metric_used": ", ".join(f"{c} (summary)" for c in metric_cols),
         "chart_hint": chart_hint,
@@ -557,11 +608,8 @@ def handle_summary(df: pd.DataFrame, intent: dict) -> dict[str, Any]:
 # ── Fallback ──────────────────────────────────────────────────────────────────
 
 def _fallback_summary(df: pd.DataFrame) -> dict[str, Any]:
-    """Generic summary when no matching column can be found."""
-    numeric_cols = [
-        c for c in df.select_dtypes(include="number").columns
-        if not _is_id_column(c)
-    ]
+    """Return basic stats on all non-ID numeric columns."""
+    numeric_cols = [c for c in df.select_dtypes(include="number").columns if not _is_id_column(c)]
     summary: dict[str, Any] = {}
     for col in numeric_cols[:5]:
         summary[col] = {
@@ -571,7 +619,9 @@ def _fallback_summary(df: pd.DataFrame) -> dict[str, Any]:
             "max": round(float(df[col].max()), 2),
         }
     return {
-        "aggregated_data": summary or {"info": f"Dataset has {len(df):,} rows and {len(df.columns)} columns"},
+        "aggregated_data": summary or {
+            "info": f"Dataset has {len(df):,} rows and {len(df.columns)} columns"
+        },
         "source_ref": f"rows 1–{len(df):,}, all numeric columns",
         "metric_used": "general summary",
         "chart_hint": "bar",
@@ -590,15 +640,7 @@ _HANDLERS = {
 
 
 def run_query(df: pd.DataFrame, intent: dict) -> dict[str, Any]:
-    """Dispatch the query to the appropriate intent handler.
-
-    Args:
-        df: The session DataFrame.
-        intent: Parsed intent dict from the intent parser.
-
-    Returns:
-        Dict with aggregated_data, source_ref, metric_used, chart_hint, analysis_type.
-    """
+    """Dispatch the query to the appropriate intent handler."""
     handler = _HANDLERS.get(intent.get("intent", "SUMMARY"), handle_summary)
     try:
         return handler(df, intent)
