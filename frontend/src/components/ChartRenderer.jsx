@@ -1,7 +1,7 @@
 /**
  * ChartRenderer – renders Recharts visualisations based on chart_type.
  *
- * Supports bar, pie, and line charts with accessible colours,
+ * Supports bar, grouped_bar, pie, and line charts with accessible colours,
  * descriptive tooltips, and labelled axes.
  */
 
@@ -72,6 +72,56 @@ function renderBarChart(data, title) {
             <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
           ))}
         </Bar>
+      </BarChart>
+    </ResponsiveContainer>
+  );
+}
+
+function renderGroupedBarChart(data, title) {
+  // Detect all numeric keys in the data (excluding 'name' and 'delta')
+  const numericKeys = data.length > 0
+    ? Object.keys(data[0]).filter(
+        (k) => k !== 'name' && k !== 'delta' && typeof data[0][k] === 'number'
+      )
+    : [];
+
+  // Friendly labels for period comparison
+  const labelMap = {
+    period_1: 'Earlier Period',
+    period_2: 'Later Period',
+    mean: 'Average',
+    min: 'Minimum',
+    max: 'Maximum',
+    median: 'Median',
+  };
+
+  return (
+    <ResponsiveContainer width="100%" height={350}>
+      <BarChart data={data} margin={{ top: 20, right: 30, left: 20, bottom: 20 }}>
+        <CartesianGrid strokeDasharray="3 3" stroke="rgba(51, 65, 85, 0.4)" />
+        <XAxis
+          dataKey="name"
+          tick={{ fill: '#94a3b8', fontSize: 12 }}
+          axisLine={{ stroke: '#334155' }}
+          tickLine={false}
+        />
+        <YAxis
+          tick={{ fill: '#94a3b8', fontSize: 12 }}
+          axisLine={{ stroke: '#334155' }}
+          tickLine={false}
+          tickFormatter={(v) => v >= 1000 ? `${(v / 1000).toFixed(1)}k` : v}
+        />
+        <Tooltip content={<CustomTooltip />} />
+        <Legend wrapperStyle={{ color: '#94a3b8', fontSize: 12 }} />
+        {numericKeys.map((key, index) => (
+          <Bar
+            key={key}
+            dataKey={key}
+            name={labelMap[key] || key}
+            fill={COLORS[index % COLORS.length]}
+            radius={[4, 4, 0, 0]}
+          />
+        ))}
       </BarChart>
     </ResponsiveContainer>
   );
@@ -153,6 +203,7 @@ export default function ChartRenderer({ chartType, chartData, title }) {
 
   const renderers = {
     bar: renderBarChart,
+    grouped_bar: renderGroupedBarChart,
     pie: renderPieChart,
     line: renderLineChart,
   };

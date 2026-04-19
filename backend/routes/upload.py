@@ -31,6 +31,39 @@ router = APIRouter()
 session_store: dict[str, tuple[pd.DataFrame, str]] = {}
 
 
+def _auto_detect_dates(df: pd.DataFrame) -> pd.DataFrame:
+    """Attempt to convert object columns that look like dates into datetime64.
+
+    Tries pd.to_datetime on each object column with a sample of values.
+    Only converts if >50% of non-null values parse successfully — this avoids
+    false positives on columns like 'name' or 'category'.
+
+    Supports both pandas 2.x (object dtype) and pandas 3.x (StringDtype).
+    """
+    # Detect string-like columns (both 'object' and pandas 3.x 'string'/'str')
+    string_cols = []
+    for col in df.columns:
+        dtype_str = str(df[col].dtype).lower()
+        if dtype_str in ("object", "string", "str") or "string" in dtype_str:
+            string_cols.append(col)
+
+    for col in string_cols:
+        sample = df[col].dropna()
+        if len(sample) == 0:
+            continue
+        # Quick check: sample up to 20 values for performance
+        test_sample = sample.head(20)
+        try:
+            converted = pd.to_datetime(test_sample, errors="coerce", format="mixed")
+            success_rate = converted.notna().sum() / len(test_sample)
+            if success_rate > 0.5:
+                df[col] = pd.to_datetime(df[col], errors="coerce", format="mixed")
+                logger.info("Auto-detected date column: %s (%.0f%% parse rate)", col, success_rate * 100)
+        except Exception:
+            pass  # Not a date column, skip silently
+    return df
+
+
 @router.post("/upload", response_model=UploadResponse)
 async def upload_file(file: UploadFile = File(...)) -> UploadResponse:
     """Accept a CSV or SQLite file upload (max 50 MB).
@@ -91,6 +124,9 @@ async def upload_file(file: UploadFile = File(...)) -> UploadResponse:
 
     # Sanitise PII columns
     df = sanitise_dataframe(df)
+
+    # Auto-detect and convert date columns stored as strings
+    df = _auto_detect_dates(df)
 
     # Truncate if over the row limit
     df, was_truncated = truncate_if_needed(df)

@@ -4,11 +4,11 @@
 /**
  * App.jsx – root application component.
  *
- * Manages top-level state (session, query results) and delegates
+ * Manages top-level state (session, query results, history) and delegates
  * all rendering to child components. No business logic lives here.
  */
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import FileUpload from './components/FileUpload';
 import QueryInput from './components/QueryInput';
 import AnswerCard from './components/AnswerCard';
@@ -17,10 +17,34 @@ import useQuery from './hooks/useQuery';
 export default function App() {
   const [session, setSession] = useState(null);
   const [currentQuestion, setCurrentQuestion] = useState('');
+  const [history, setHistory] = useState([]); // [{question, result}]
   const { result, loading, error, ask, reset } = useQuery();
+  const resultsEndRef = useRef(null);
+
+  // When a new result arrives, add it to history
+  useEffect(() => {
+    if (result && currentQuestion && !loading) {
+      setHistory((prev) => {
+        // Avoid duplicates (same question + same answer)
+        const lastEntry = prev[prev.length - 1];
+        if (lastEntry && lastEntry.question === currentQuestion) {
+          return prev;
+        }
+        return [...prev, { question: currentQuestion, result }];
+      });
+    }
+  }, [result, currentQuestion, loading]);
+
+  // Auto-scroll to latest result
+  useEffect(() => {
+    if (resultsEndRef.current) {
+      resultsEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [history, loading]);
 
   const handleUploadSuccess = useCallback((uploadData) => {
     setSession(uploadData);
+    setHistory([]);
     reset();
   }, [reset]);
 
@@ -33,6 +57,7 @@ export default function App() {
   const handleNewDataset = useCallback(() => {
     setSession(null);
     setCurrentQuestion('');
+    setHistory([]);
     reset();
   }, [reset]);
 
@@ -53,17 +78,24 @@ export default function App() {
             </div>
           </div>
 
-          {session && (
-            <button
-              id="new-dataset-btn"
-              onClick={handleNewDataset}
-              className="text-xs text-surface-200/50 hover:text-primary-300 
-                         border border-surface-200/10 hover:border-primary-400/30 
-                         px-3 py-1.5 rounded-lg transition-all duration-200"
-            >
-              New dataset
-            </button>
-          )}
+          <div className="flex items-center gap-3">
+            {session && history.length > 0 && (
+              <span className="text-[11px] text-surface-200/30 font-medium">
+                {history.length} question{history.length !== 1 ? 's' : ''} answered
+              </span>
+            )}
+            {session && (
+              <button
+                id="new-dataset-btn"
+                onClick={handleNewDataset}
+                className="text-xs text-surface-200/50 hover:text-primary-300 
+                           border border-surface-200/10 hover:border-primary-400/30 
+                           px-3 py-1.5 rounded-lg transition-all duration-200"
+              >
+                New dataset
+              </button>
+            )}
+          </div>
         </div>
       </header>
 
@@ -115,6 +147,17 @@ export default function App() {
               disabled={!session}
             />
 
+            {/* Previous answers (history) */}
+            {history.length > 0 && (
+              <div className="flex flex-col gap-4">
+                {history.map((entry, idx) => (
+                  <div key={idx} className="opacity-85 hover:opacity-100 transition-opacity">
+                    <AnswerCard result={entry.result} question={entry.question} />
+                  </div>
+                ))}
+              </div>
+            )}
+
             {/* Loading state */}
             {loading && (
               <div className="glass rounded-2xl p-8 animate-fade-in">
@@ -152,10 +195,8 @@ export default function App() {
               </div>
             )}
 
-            {/* Result */}
-            {result && !loading && (
-              <AnswerCard result={result} question={currentQuestion} />
-            )}
+            {/* Scroll anchor */}
+            <div ref={resultsEndRef} />
           </div>
         )}
       </main>
