@@ -174,6 +174,12 @@ def _build_breakdown_prompt(question: str, intent: dict, result: dict) -> str:
         if outliers:
             concentration_text += f" Outlier groups (unusually high/low): {', '.join(outliers)}."
 
+    pct_note = (
+        "Each entry has 'value' and 'percentage' (share of total)."
+        if show_pct
+        else "Each entry has 'value' only (percentages are not shown because the metric is an average)."
+    )
+
     extra = ""
     if secondary:
         extra = (
